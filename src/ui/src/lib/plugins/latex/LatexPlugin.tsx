@@ -97,12 +97,29 @@ function useIsDarkMode(): boolean {
   return isDark;
 }
 
+type PdfScrollSnapshot = {
+  pageNumber: number;
+  pageOffsetRatio: number;
+  viewportAnchorRatio: number;
+};
+
+type PdfScrollRestoreRequest = {
+  id: string;
+  snapshot: PdfScrollSnapshot;
+};
+
+type PdfSurfaceHandle = {
+  getScrollSnapshot: (viewportAnchorRatio?: number) => PdfScrollSnapshot | null;
+};
+
 type PdfSurfaceProps = {
   pdfDocument: PDFDocumentProxy;
   zoomFactor: number;
   highlights: IHighlight[];
   onPageWidth: (width: number) => void;
   onPointDoubleClick?: (point: PdfSourcePoint) => void;
+  restoreRequest?: PdfScrollRestoreRequest | null;
+  onRestoreConsumed?: (id: string) => void;
 };
 
 type PdfWordBox = {
@@ -563,7 +580,119 @@ function hitTestPdfTextLayerWord(
   };
 }
 
-function PdfSurface({ pdfDocument, zoomFactor, highlights, onPageWidth, onPointDoubleClick }: PdfSurfaceProps) {
+function clampNumber(value: number, min: number, max: number) {
+  if (!Number.isFinite(value)) return min;
+  return Math.min(Math.max(value, min), max);
+}
+
+function pdfScrollContainerFromHighlighter(highlighter: PdfHighlighter<IHighlight> | null) {
+  const container = highlighter?.viewer?.container;
+  return container instanceof HTMLElement ? container : null;
+}
+
+function pdfPageElements(container: HTMLElement) {
+  return Array.from(container.querySelectorAll<HTMLElement>(".page[data-page-number]"))
+    .filter((page) => Number.isFinite(Number(page.dataset.pageNumber || "")));
+}
+
+function pdfPageTopInContainer(container: HTMLElement, page: HTMLElement) {
+  const containerRect = container.getBoundingClientRect();
+  const pageRect = page.getBoundingClientRect();
+  return pageRect.top - containerRect.top + container.scrollTop;
+}
+
+function snapshotPdfScrollPosition(
+  highlighter: PdfHighlighter<IHighlight> | null,
+  viewportAnchorRatio = 0.33
+): PdfScrollSnapshot | null {
+  const container = pdfScrollContainerFromHighlighter(highlighter);
+  if (!container) return null;
+  const pages = pdfPageElements(container);
+  if (!pages.length) return null;
+
+  const safeAnchorRatio = clampNumber(viewportAnchorRatio, 0, 1);
+  const anchorY = container.scrollTop + container.clientHeight * safeAnchorRatio;
+  let bestPage: HTMLElement | null = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+
+  for (const page of pages) {
+    const pageRect = page.getBoundingClientRect();
+    if (!pageRect.height) continue;
+    const pageTop = pdfPageTopInContainer(container, page);
+    const pageBottom = pageTop + pageRect.height;
+    if (anchorY >= pageTop && anchorY <= pageBottom) {
+      bestPage = page;
+      break;
+    }
+    const distance = Math.min(Math.abs(anchorY - pageTop), Math.abs(anchorY - pageBottom));
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestPage = page;
+    }
+  }
+
+  if (!bestPage) return null;
+  const pageNumber = Number(bestPage.dataset.pageNumber || "");
+  const pageRect = bestPage.getBoundingClientRect();
+  if (!Number.isFinite(pageNumber) || pageNumber < 1 || !pageRect.height) return null;
+  const pageTop = pdfPageTopInContainer(container, bestPage);
+  const pageOffsetRatio = clampNumber((anchorY - pageTop) / pageRect.height, 0, 1);
+
+  return {
+    pageNumber: Math.trunc(pageNumber),
+    pageOffsetRatio,
+    viewportAnchorRatio: safeAnchorRatio,
+  };
+}
+
+function restorePdfScrollPosition(
+  highlighter: PdfHighlighter<IHighlight> | null,
+  snapshot: PdfScrollSnapshot,
+  numPages: number
+) {
+  const container = pdfScrollContainerFromHighlighter(highlighter);
+  if (!container) return false;
+  const safeNumPages = Math.max(1, Math.trunc(Number(numPages) || 1));
+  const targetPageNumber = clampNumber(Math.trunc(Number(snapshot.pageNumber) || 1), 1, safeNumPages);
+  const page = container.querySelector<HTMLElement>(`.page[data-page-number="${targetPageNumber}"]`);
+  if (!page) return false;
+
+  const pageRect = page.getBoundingClientRect();
+  if (!pageRect.height || !container.clientHeight) return false;
+
+  const pageTop = pdfPageTopInContainer(container, page);
+  const pageOffsetRatio = clampNumber(Number(snapshot.pageOffsetRatio), 0, 1);
+  const viewportAnchorRatio = clampNumber(Number(snapshot.viewportAnchorRatio), 0, 1);
+  const nextScrollTop =
+    pageTop + pageRect.height * pageOffsetRatio - container.clientHeight * viewportAnchorRatio;
+  const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+  container.scrollTop = clampNumber(nextScrollTop, 0, maxScrollTop);
+  return true;
+}
+
+const PdfSurface = React.forwardRef<PdfSurfaceHandle, PdfSurfaceProps>(function PdfSurface(
+  {
+    pdfDocument,
+    zoomFactor,
+    highlights,
+    onPageWidth,
+    onPointDoubleClick,
+    restoreRequest,
+    onRestoreConsumed,
+  },
+  ref
+) {
+  const pdfHighlighterRef = React.useRef<PdfHighlighter<IHighlight> | null>(null);
+
+  React.useImperativeHandle(
+    ref,
+    () => ({
+      getScrollSnapshot: (viewportAnchorRatio?: number) =>
+        snapshotPdfScrollPosition(pdfHighlighterRef.current, viewportAnchorRatio),
+    }),
+    []
+  );
+
   React.useEffect(() => {
     let cancelled = false;
     pdfDocument
@@ -582,6 +711,53 @@ function PdfSurface({ pdfDocument, zoomFactor, highlights, onPageWidth, onPointD
       cancelled = true;
     };
   }, [onPageWidth, pdfDocument]);
+
+  React.useEffect(() => {
+    if (!restoreRequest) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    let raf: number | null = null;
+    let attempts = 0;
+    const maxAttempts = 30;
+
+    const clearScheduled = () => {
+      if (timer != null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+      if (raf != null) {
+        window.cancelAnimationFrame(raf);
+        raf = null;
+      }
+    };
+
+    const tryRestore = () => {
+      if (cancelled) return;
+      const restored = restorePdfScrollPosition(
+        pdfHighlighterRef.current,
+        restoreRequest.snapshot,
+        pdfDocument.numPages
+      );
+      if (restored) {
+        onRestoreConsumed?.(restoreRequest.id);
+        return;
+      }
+      attempts += 1;
+      if (attempts >= maxAttempts) {
+        onRestoreConsumed?.(restoreRequest.id);
+        return;
+      }
+      timer = window.setTimeout(() => {
+        raf = window.requestAnimationFrame(tryRestore);
+      }, 50);
+    };
+
+    raf = window.requestAnimationFrame(tryRestore);
+    return () => {
+      cancelled = true;
+      clearScheduled();
+    };
+  }, [onRestoreConsumed, pdfDocument, restoreRequest]);
 
   const safeZoomFactor = Number.isFinite(zoomFactor) && zoomFactor > 0 ? zoomFactor : 1;
   const pdfScaleValue =
@@ -656,6 +832,7 @@ function PdfSurface({ pdfDocument, zoomFactor, highlights, onPageWidth, onPointD
       }}
     >
       <PdfHighlighter<IHighlight>
+        ref={pdfHighlighterRef as React.Ref<PdfHighlighter<IHighlight>>}
         pdfDocument={pdfDocument}
         pdfScaleValue={pdfScaleValue}
         highlights={highlights}
@@ -672,7 +849,7 @@ function PdfSurface({ pdfDocument, zoomFactor, highlights, onPageWidth, onPointD
       />
     </div>
   );
-}
+});
 
 export default function LatexPlugin({ context, tabId, setDirty, setTitle }: PluginComponentProps) {
   const custom = (context.customData ?? {}) as LatexTabContext;
@@ -723,6 +900,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
   const [autoCompileOnSave, setAutoCompileOnSave] = React.useState(true);
   const [currentBranch, setCurrentBranch] = React.useState<string | null>(null);
   const [pdfObjectUrl, setPdfObjectUrl] = React.useState<string | null>(null);
+  const [pdfRestoreRequest, setPdfRestoreRequest] = React.useState<PdfScrollRestoreRequest | null>(null);
   const [logText, setLogText] = React.useState<string | null>(null);
   const [zoomScale, setZoomScale] = React.useState<number>(1);
   const [pdfPageWidth, setPdfPageWidth] = React.useState<number>(PAGE_DIMENSIONS.A4_WIDTH);
@@ -762,6 +940,8 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
   const [resetNonce, setResetNonce] = React.useState(0);
   const pdfUrlRef = React.useRef<string | null>(null);
   const lastLoadedPdfBuildIdRef = React.useRef<string | null>(null);
+  const pdfSurfaceRef = React.useRef<PdfSurfaceHandle | null>(null);
+  const restoreScrollByBuildIdRef = React.useRef<Map<string, PdfScrollSnapshot>>(new Map());
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
   const pdfPaneRef = React.useRef<HTMLDivElement | null>(null);
   const editorRef = React.useRef<any>(null);
@@ -2320,6 +2500,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       if (!projectId || !latexFolderId) return;
       if (viewReadOnly) return;
       if (buildStatusRef.current === "queued" || buildStatusRef.current === "running") return;
+      const restoreSnapshot = pdfSurfaceRef.current?.getScrollSnapshot() ?? null;
       if (!effectiveReadOnly && (isDirtyRef.current || saveStateRef.current === "saving")) {
         const saved = await save("compile");
         if (!saved) return;
@@ -2340,6 +2521,9 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
           stop_on_first_error: false,
         });
         setBuildId(res.build_id);
+        if (restoreSnapshot && res.build_id) {
+          restoreScrollByBuildIdRef.current.set(res.build_id, restoreSnapshot);
+        }
         setCompiler(normalizeCompiler(res.compiler));
         setSynctexReady(Boolean(res.synctex_ready));
         buildStatusRef.current = res.status ?? "queued";
@@ -2475,6 +2659,11 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
               }
               pdfUrlRef.current = nextUrl;
               setPdfObjectUrl(nextUrl);
+              const restoreSnapshot = restoreScrollByBuildIdRef.current.get(buildId) ?? null;
+              restoreScrollByBuildIdRef.current.delete(buildId);
+              setPdfRestoreRequest(
+                restoreSnapshot ? { id: buildId, snapshot: restoreSnapshot } : null
+              );
               lastLoadedPdfBuildIdRef.current = buildId;
             } catch (e) {
               console.warn("[LatexPlugin] Failed to fetch PDF:", e);
@@ -2868,6 +3057,10 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
   const renderScale = fitScale * zoomScale;
   const handlePageWidth = React.useCallback((width: number) => {
     setPdfPageWidth(width || PAGE_DIMENSIONS.A4_WIDTH);
+  }, []);
+
+  const handlePdfRestoreConsumed = React.useCallback((id: string) => {
+    setPdfRestoreRequest((current) => (current?.id === id ? null : current));
   }, []);
 
   const handlePdfPointDoubleClick = React.useCallback(
@@ -3566,11 +3759,14 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
               >
                 {(pdfDocument) => (
                   <PdfSurface
+                    ref={pdfSurfaceRef}
                     pdfDocument={pdfDocument}
 	                    zoomFactor={zoomScale}
 	                    highlights={emptyHighlights}
 	                    onPageWidth={handlePageWidth}
 	                    onPointDoubleClick={handlePdfPointDoubleClick}
+                    restoreRequest={pdfRestoreRequest}
+                    onRestoreConsumed={handlePdfRestoreConsumed}
 	                  />
 	                )}
               </PdfLoader>
