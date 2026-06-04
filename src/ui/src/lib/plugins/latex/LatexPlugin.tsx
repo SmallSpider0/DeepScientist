@@ -17,7 +17,13 @@ import {
 import type { PluginComponentProps } from "@/lib/types/plugin";
 import { cn } from "@/lib/utils";
 import { client as questClient } from "@/lib/api";
-import { listFiles, getFileContent, updateFileContent } from "@/lib/api/files";
+import {
+  listFiles,
+  getFileContent,
+  getFileContentSnapshot,
+  updateFileContent,
+  type FileContentSnapshot,
+} from "@/lib/api/files";
 import { useFileTreeStore } from "@/lib/stores/file-tree";
 import { ProjectSyncClient } from "@/lib/plugins/notebook/lib/project-sync";
 import { useAuthStore } from "@/lib/stores/auth";
@@ -35,14 +41,17 @@ import { PAGE_DIMENSIONS, ZOOM_LEVELS } from "@/lib/plugins/pdf-viewer/types";
 import { PDF_CMAP_URL, PDF_WORKER_SRC } from "@/lib/plugins/pdf-viewer/lib/pdf-utils";
 import {
   compileLatex,
+  getLatexManifest,
   getLatexBuild,
   getLatexBuildLogText,
   getLatexBuildPdfBlob,
   listLatexBuilds,
+  syncTexEditLatexBuild,
   type LatexCompiler,
   type LatexBuildStatus,
   type LatexBuildError,
   type LatexLogItem,
+  type LatexSyncTexSelection,
 } from "@/lib/api/latex";
 import { useI18n } from "@/lib/i18n/useI18n";
 import { useWorkspaceSurfaceStore } from "@/lib/stores/workspace-surface";
@@ -53,6 +62,11 @@ import {
   LATEX_LANGUAGE_ID,
   ensureMonacoLatexLanguages,
 } from "@/lib/monaco-latex";
+import {
+  LATEX_OPEN_FILE_EVENT,
+  consumeLatexOpenFileRequests,
+  type LatexOpenFileRequest,
+} from "@/lib/latex/open-queue";
 
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), { ssr: false });
 configureMonacoLoader();
@@ -88,12 +102,46 @@ type PdfSurfaceProps = {
   zoomFactor: number;
   highlights: IHighlight[];
   onPageWidth: (width: number) => void;
+  onPointDoubleClick?: (point: PdfSourcePoint) => void;
+};
+
+type PdfWordBox = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width?: number;
+  height?: number;
+};
+
+type PdfSourcePoint = {
+  page: number;
+  x: number;
+  y: number;
+  word?: string | null;
+  contextWords?: string[] | null;
+  contextIndex?: number | null;
+  wordBBox?: PdfWordBox | null;
+  wordCenter?: { x: number; y: number } | null;
 };
 
 type LatexFileMeta = {
   id: string;
   name: string;
   path?: string;
+  relativePath?: string;
+  role?: string;
+  editable?: boolean;
+};
+
+type LatexSaveState = "idle" | "saving" | "error";
+type LatexSaveTrigger = "manual" | "auto" | "lifecycle" | "compile";
+type PendingJumpLocation = {
+  fileId: string | null;
+  line: number;
+  column?: number | null;
+  word?: string | null;
+  selection?: LatexSyncTexSelection | null;
 };
 
 type LatexSaveState = "idle" | "saving" | "error";
@@ -124,6 +172,14 @@ type CitationEntry = {
 type LabelEntry = {
   key: string;
   sourceFile: string;
+};
+
+type LatexExternalConflict = {
+  fileId: string;
+  remoteContent: string;
+  remoteRevision?: string | null;
+  remoteUpdatedAt?: string | null;
+  reason: "poll" | "focus" | "visibility" | "diff" | "save_conflict";
 };
 
 type BibSnippet = {
@@ -157,6 +213,7 @@ const normalizeBuildErrors = (
 
 const LATEX_COMPILER_OPTIONS: LatexCompiler[] = ["pdflatex", "xelatex", "lualatex"];
 const LATEX_AUTOSAVE_DELAY_MS = 1000;
+const LATEX_EXTERNAL_CHECK_INTERVAL_MS = 4000;
 const LATEX_AUTO_COMPILE_ON_SAVE_STORAGE_PREFIX = "ds:latex:auto-compile-on-save";
 const BIB_SNIPPETS: BibSnippet[] = [
   {
@@ -332,20 +389,181 @@ function resolveLatexFileId(files: LatexFileMeta[], rawPath?: string | null) {
   const normalized = normalizeLatexPath(rawPath);
   if (!normalized) return null;
 
-  const exact = files.find((file) => normalizeLatexPath(file.name) === normalized);
+  const exact = files.find(
+    (file) =>
+      normalizeLatexPath(file.path) === normalized ||
+      normalizeLatexPath(file.relativePath) === normalized ||
+      normalizeLatexPath(file.name) === normalized
+  );
   if (exact) return exact.id;
 
   const basename = normalized.split("/").filter(Boolean).pop();
   if (!basename) return null;
 
-  const byBasename = files.find((file) => normalizeLatexPath(file.name).endsWith(`/${basename}`));
+  const byBasename = files.find((file) =>
+    [file.path, file.relativePath, file.name].some((value) =>
+      normalizeLatexPath(value).endsWith(`/${basename}`)
+    )
+  );
   if (byBasename) return byBasename.id;
 
   const simpleName = files.find((file) => file.name.toLowerCase() === basename);
   return simpleName?.id ?? null;
 }
 
-function PdfSurface({ pdfDocument, zoomFactor, highlights, onPageWidth }: PdfSurfaceProps) {
+function latexFileDisplayPath(file?: LatexFileMeta | null) {
+  return file?.relativePath || file?.path || file?.name || "";
+}
+
+function isEditableLatexManifestFile(file: LatexFileMeta) {
+  if (file.editable === true) return true;
+  const lower = (file.name || file.path || "").toLowerCase();
+  return (
+    lower.endsWith(".tex") ||
+    lower.endsWith(".bib") ||
+    lower.endsWith(".cls") ||
+    lower.endsWith(".sty") ||
+    lower.endsWith(".bst") ||
+    lower.endsWith(".bbx") ||
+    lower.endsWith(".cbx")
+  );
+}
+
+function resolveLatexOpenRequestFileId(files: LatexFileMeta[], request: LatexOpenFileRequest) {
+  if (request.fileId && files.some((file) => file.id === request.fileId)) {
+    return request.fileId;
+  }
+  return resolveLatexFileId(files, request.filePath);
+}
+
+function latexWordCharacter(char: string) {
+  return /[\p{L}\p{N}_:-]/u.test(char);
+}
+
+type PdfWordHit = {
+  word: string;
+  clientBox: PdfWordBox;
+  contextWords?: string[];
+  contextIndex?: number;
+};
+
+function rectDistanceToPoint(rect: DOMRect | PdfWordBox, x: number, y: number) {
+  const dx = x < rect.left ? rect.left - x : x > rect.right ? x - rect.right : 0;
+  const dy = y < rect.top ? rect.top - y : y > rect.bottom ? y - rect.bottom : 0;
+  return Math.hypot(dx, dy);
+}
+
+function rectContainsPoint(rect: DOMRect | PdfWordBox, x: number, y: number, tolerance = 0) {
+  return (
+    x >= rect.left - tolerance &&
+    x <= rect.right + tolerance &&
+    y >= rect.top - tolerance &&
+    y <= rect.bottom + tolerance
+  );
+}
+
+function rangeBoundingBox(range: Range): PdfWordBox | null {
+  const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+  if (rects.length === 0) return null;
+  const left = Math.min(...rects.map((rect) => rect.left));
+  const top = Math.min(...rects.map((rect) => rect.top));
+  const right = Math.max(...rects.map((rect) => rect.right));
+  const bottom = Math.max(...rects.map((rect) => rect.bottom));
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+function firstTextNode(element: Element): Text | null {
+  const walker = element.ownerDocument.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  while (node) {
+    if (node.nodeType === Node.TEXT_NODE && (node.textContent || "").trim()) {
+      return node as Text;
+    }
+    node = walker.nextNode();
+  }
+  return null;
+}
+
+function textLayerWordEntries(doc: Document, textLayer: Element) {
+  const entries: Array<{ word: string; clientBox: PdfWordBox }> = [];
+  for (const element of Array.from(textLayer.querySelectorAll("span, div"))) {
+    const textNode = firstTextNode(element);
+    const source = textNode?.textContent || "";
+    if (!textNode || !source.trim()) continue;
+    let index = 0;
+    while (index < source.length) {
+      if (!latexWordCharacter(source[index])) {
+        index += 1;
+        continue;
+      }
+      const start = index;
+      index += 1;
+      while (index < source.length && latexWordCharacter(source[index])) index += 1;
+      const word = source.slice(start, index).trim();
+      if (!word) continue;
+      const range = doc.createRange();
+      try {
+        range.setStart(textNode, start);
+        range.setEnd(textNode, index);
+        const clientBox = rangeBoundingBox(range);
+        if (clientBox) entries.push({ word, clientBox });
+      } finally {
+        range.detach?.();
+      }
+    }
+  }
+  return entries;
+}
+
+function hitTestPdfTextLayerWord(
+  event: React.MouseEvent<HTMLDivElement>,
+  pageElement: HTMLElement
+): PdfWordHit | null {
+  const doc = event.currentTarget.ownerDocument;
+  const textLayer = pageElement.querySelector(".textLayer");
+  if (!textLayer) return null;
+
+  const clientX = event.clientX;
+  const clientY = event.clientY;
+  const entries = textLayerWordEntries(doc, textLayer)
+    .map((entry) => ({
+      ...entry,
+      score:
+        (rectContainsPoint(entry.clientBox, clientX, clientY, 2) ? 100000 : 0) -
+        rectDistanceToPoint(entry.clientBox, clientX, clientY),
+    }))
+    .sort((a, b) => b.score - a.score);
+
+  const best = entries[0];
+  if (!best || best.score < -12) return null;
+  const centerY = (best.clientBox.top + best.clientBox.bottom) / 2;
+  const tolerance = Math.max(Number(best.clientBox.height || 0) * 0.9, 6);
+  const lineEntries = entries
+    .filter((entry) => {
+      const entryCenterY = (entry.clientBox.top + entry.clientBox.bottom) / 2;
+      return Math.abs(entryCenterY - centerY) <= tolerance;
+    })
+    .sort((a, b) => a.clientBox.left - b.clientBox.left);
+  const lineIndex = lineEntries.findIndex((entry) => entry === best);
+  const contextStart = Math.max(0, lineIndex - 5);
+  const contextEnd = Math.min(lineEntries.length, lineIndex + 6);
+  const contextSlice = lineEntries.slice(contextStart, contextEnd);
+  return {
+    word: best.word,
+    clientBox: best.clientBox,
+    contextWords: contextSlice.map((entry) => entry.word),
+    contextIndex: Math.max(0, lineIndex - contextStart),
+  };
+}
+
+function PdfSurface({ pdfDocument, zoomFactor, highlights, onPageWidth, onPointDoubleClick }: PdfSurfaceProps) {
   React.useEffect(() => {
     let cancelled = false;
     pdfDocument
@@ -370,21 +588,89 @@ function PdfSurface({ pdfDocument, zoomFactor, highlights, onPageWidth }: PdfSur
     Math.abs(safeZoomFactor - 1) < 0.001 ? "page-width" : `page-width:${safeZoomFactor}`;
 
   return (
-    <PdfHighlighter<IHighlight>
-      pdfDocument={pdfDocument}
-      pdfScaleValue={pdfScaleValue}
-      highlights={highlights}
-      highlightTransform={() => <></>}
-      onScrollChange={() => {}}
-      scrollRef={() => {}}
-      onSelectionFinished={(
-        _position: ScaledPosition,
-        _content: Content,
-        _hideTipAndSelection: () => void,
-        _transformSelection: () => void
-      ) => null}
-      enableAreaSelection={() => false}
-    />
+    <div
+      className="relative h-full w-full"
+      onDoubleClickCapture={(event) => {
+        if (!onPointDoubleClick) return;
+        const target = event.target;
+        if (!(target instanceof Element)) return;
+        const pageElement = target.closest(".page[data-page-number]") as HTMLElement | null;
+        if (!pageElement) return;
+        const pageNumber = Number(pageElement.dataset.pageNumber || "");
+        if (!Number.isFinite(pageNumber) || pageNumber < 1) return;
+        const pageRect = pageElement.getBoundingClientRect();
+        if (!pageRect.width || !pageRect.height) return;
+        const localX = event.clientX - pageRect.left;
+        const localY = event.clientY - pageRect.top;
+        if (localX < 0 || localY < 0 || localX > pageRect.width || localY > pageRect.height) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const wordHit = hitTestPdfTextLayerWord(event, pageElement);
+        void pdfDocument
+          .getPage(pageNumber)
+          .then((page) => {
+            const viewport = page.getViewport({ scale: 1 });
+            const scaleX = viewport.width / pageRect.width;
+            const scaleY = viewport.height / pageRect.height;
+            const toPdfX = (clientX: number) => (clientX - pageRect.left) * scaleX;
+            const toPdfY = (clientY: number) => (clientY - pageRect.top) * scaleY;
+            const wordBBox = wordHit?.clientBox
+              ? {
+                  left: toPdfX(wordHit.clientBox.left),
+                  top: toPdfY(wordHit.clientBox.top),
+                  right: toPdfX(wordHit.clientBox.right),
+                  bottom: toPdfY(wordHit.clientBox.bottom),
+                  width: wordHit.clientBox.width ? wordHit.clientBox.width * scaleX : undefined,
+                  height: wordHit.clientBox.height ? wordHit.clientBox.height * scaleY : undefined,
+                }
+              : null;
+            const wordCenter = wordBBox
+              ? {
+                  x: (wordBBox.left + wordBBox.right) / 2,
+                  y: (wordBBox.top + wordBBox.bottom) / 2,
+                }
+              : null;
+            const x = wordCenter?.x ?? localX * scaleX;
+            const y = wordCenter?.y ?? localY * scaleY;
+            onPointDoubleClick({
+              page: pageNumber,
+              x,
+              y,
+              word: wordHit?.word ?? null,
+              contextWords: wordHit?.contextWords ?? null,
+              contextIndex: wordHit?.contextIndex ?? null,
+              wordBBox,
+              wordCenter,
+            });
+          })
+          .catch(() => {
+            onPointDoubleClick({
+              page: pageNumber,
+              x: localX,
+              y: localY,
+              word: wordHit?.word ?? null,
+              contextWords: wordHit?.contextWords ?? null,
+              contextIndex: wordHit?.contextIndex ?? null,
+            });
+          });
+      }}
+    >
+      <PdfHighlighter<IHighlight>
+        pdfDocument={pdfDocument}
+        pdfScaleValue={pdfScaleValue}
+        highlights={highlights}
+        highlightTransform={() => <></>}
+        onScrollChange={() => {}}
+        scrollRef={() => {}}
+        onSelectionFinished={(
+          _position: ScaledPosition,
+          _content: Content,
+          _hideTipAndSelection: () => void,
+          _transformSelection: () => void
+        ) => null}
+        enableAreaSelection={() => false}
+      />
+    </div>
   );
 }
 
@@ -407,15 +693,22 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
   const initialFileId = custom.openFileId ?? custom.mainFileId ?? null;
   const [activeFileId, setActiveFileId] = React.useState<string | null>(initialFileId);
   const [activeFileName, setActiveFileName] = React.useState<string>("main.tex");
+  const [manifestMainFileId, setManifestMainFileId] = React.useState<string | null>(
+    custom.mainFileId ?? null
+  );
   const compileMainFileId = React.useMemo(() => {
     if (custom.mainFileId) return custom.mainFileId;
-    return files.find((file) => file.name.toLowerCase() === "main.tex")?.id ?? null;
-  }, [custom.mainFileId, files]);
+    if (manifestMainFileId) return manifestMainFileId;
+    return files.find((file) => file.role === "main")?.id ??
+      files.find((file) => file.name.toLowerCase() === "main.tex")?.id ??
+      null;
+  }, [custom.mainFileId, files, manifestMainFileId]);
   const [initialText, setInitialText] = React.useState<string>("");
   const [syncState, setSyncState] = React.useState<"idle" | "loading" | "ready" | "error">("idle");
   const [saveState, setSaveState] = React.useState<LatexSaveState>("idle");
   const [saveTrigger, setSaveTrigger] = React.useState<LatexSaveTrigger>("manual");
   const [saveError, setSaveError] = React.useState<string | null>(null);
+  const [externalConflict, setExternalConflict] = React.useState<LatexExternalConflict | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const [isDirty, setIsDirty] = React.useState(false);
   const [dirtyVersion, setDirtyVersion] = React.useState(0);
@@ -423,6 +716,9 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
   const [buildStatus, setBuildStatus] = React.useState<LatexBuildStatus | "idle">("idle");
   const [buildError, setBuildError] = React.useState<string | null>(null);
   const [buildErrors, setBuildErrors] = React.useState<LatexBuildError[]>([]);
+  const [synctexReady, setSynctexReady] = React.useState(false);
+  const [synctexBusy, setSynctexBusy] = React.useState(false);
+  const [synctexError, setSynctexError] = React.useState<string | null>(null);
   const [compiler, setCompiler] = React.useState<LatexCompiler>("pdflatex");
   const [autoCompileOnSave, setAutoCompileOnSave] = React.useState(true);
   const [currentBranch, setCurrentBranch] = React.useState<string | null>(null);
@@ -449,6 +745,10 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
   const saveInFlightRef = React.useRef<{ fileId: string; promise: Promise<boolean> } | null>(null);
   const failedSaveTextRef = React.useRef<string | null>(null);
   const lastSaveTriggerRef = React.useRef<LatexSaveTrigger>("manual");
+  const savedRevisionRef = React.useRef<string | null>(null);
+  const loadedRevisionRef = React.useRef<string | null>(null);
+  const externalConflictRef = React.useRef<LatexExternalConflict | null>(null);
+  const externalCheckInFlightRef = React.useRef(false);
   const yDocRef = React.useRef<any>(null);
   const yTextRef = React.useRef<any>(null);
   const syncRef = React.useRef<ProjectSyncClient | null>(null);
@@ -465,7 +765,8 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
   const splitContainerRef = React.useRef<HTMLDivElement | null>(null);
   const pdfPaneRef = React.useRef<HTMLDivElement | null>(null);
   const editorRef = React.useRef<any>(null);
-  const pendingJumpRef = React.useRef<{ fileId: string | null; line: number } | null>(null);
+  const boundEditorFileIdRef = React.useRef<string | null>(null);
+  const pendingJumpRef = React.useRef<PendingJumpLocation | null>(null);
   const citationIndexRef = React.useRef<CitationEntry[]>([]);
   const labelIndexRef = React.useRef<LabelEntry[]>([]);
   const latexCompletionDisposablesRef = React.useRef<Array<{ dispose?: () => void }>>([]);
@@ -536,6 +837,102 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
     const ytext = yTextRef.current;
     return ytext ? String(ytext.toString?.() ?? "") : "";
   }, []);
+
+  const setExternalConflictState = React.useCallback((conflict: LatexExternalConflict | null) => {
+    externalConflictRef.current = conflict;
+    setExternalConflict(conflict);
+  }, []);
+
+  const applyFileSnapshotToEditor = React.useCallback(
+    (fileId: string, snapshot: Pick<FileContentSnapshot, "content" | "revision" | "updated_at" | "size" | "mime_type">) => {
+      const content = String(snapshot.content ?? "");
+      const revision = snapshot.revision ?? null;
+      const ydoc = yDocRef.current;
+      const ytext = yTextRef.current;
+      let origin = remoteOriginRef.current;
+      if (!origin) {
+        origin = `ds-external:${projectId || "project"}:${fileId}:${Date.now()}`;
+        remoteOriginRef.current = origin;
+      }
+
+      applyingRemoteRef.current = true;
+      try {
+        if (ydoc && ytext) {
+          ydoc.transact(() => {
+            const length = Number(ytext.length || 0);
+            if (length) ytext.delete(0, length);
+            if (content) ytext.insert(0, content);
+          }, origin);
+        }
+
+        const editor = editorRef.current;
+        const model = editor?.getModel?.();
+        if (model && typeof model.getValue === "function" && model.getValue() !== content) {
+          model.setValue(content);
+        }
+      } finally {
+        applyingRemoteRef.current = false;
+      }
+
+      setInitialText(content);
+      lastSavedRef.current = content;
+      loadedRevisionRef.current = revision;
+      savedRevisionRef.current = revision;
+      failedSaveTextRef.current = null;
+      setSaveError(null);
+      saveStateRef.current = "idle";
+      setSaveState("idle");
+      setEditorDirty(false);
+      setExternalConflictState(null);
+      if (fileId) {
+        updateFileMeta(fileId, {
+          updatedAt: snapshot.updated_at ?? undefined,
+          size: typeof snapshot.size === "number" ? snapshot.size : undefined,
+          mimeType: snapshot.mime_type ?? undefined,
+        });
+      }
+    },
+    [projectId, setEditorDirty, setExternalConflictState, updateFileMeta]
+  );
+
+  const checkExternalSnapshot = React.useCallback(
+    async (reason: LatexExternalConflict["reason"] = "poll") => {
+      const fileId = activeFileIdRef.current;
+      if (!fileId || syncState !== "ready") return;
+      if (saveStateRef.current === "saving") return;
+      if (externalCheckInFlightRef.current) return;
+
+      externalCheckInFlightRef.current = true;
+      try {
+        const snapshot = await getFileContentSnapshot(fileId);
+        if (activeFileIdRef.current !== fileId) return;
+        const remoteRevision = snapshot.revision ?? null;
+        const knownRevision = savedRevisionRef.current;
+        const changed = remoteRevision && knownRevision
+          ? remoteRevision !== knownRevision
+          : String(snapshot.content ?? "") !== lastSavedRef.current;
+        if (!changed) return;
+
+        if (isDirtyRef.current) {
+          setExternalConflictState({
+            fileId,
+            remoteContent: String(snapshot.content ?? ""),
+            remoteRevision,
+            remoteUpdatedAt: snapshot.updated_at ?? null,
+            reason,
+          });
+          return;
+        }
+
+        applyFileSnapshotToEditor(fileId, snapshot);
+      } catch (e) {
+        console.warn("[LatexPlugin] External LaTeX refresh check failed:", e);
+      } finally {
+        externalCheckInFlightRef.current = false;
+      }
+    },
+    [applyFileSnapshotToEditor, setExternalConflictState, syncState]
+  );
 
   React.useEffect(() => {
     const activeFileMeta =
@@ -633,44 +1030,111 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
     };
   }, [projectId]);
 
-  // Load folder file list.
+  // Load the LaTeX project manifest. The manifest is recursive so multi-file
+  // papers (sections, shared .bib/.sty files, etc.) are managed in one editor.
   React.useEffect(() => {
     if (!projectId || !latexFolderId) return;
     let cancelled = false;
+
+    const resolveInitialFile = (candidates: LatexFileMeta[], mainFileId?: string | null) => {
+      const queuedRequests = consumeLatexOpenFileRequests(projectId, latexFolderId);
+      for (const request of queuedRequests.slice().reverse()) {
+        const requested = resolveLatexOpenRequestFileId(candidates, request);
+        if (requested) {
+          if (request.line) {
+            pendingJumpRef.current = {
+              fileId: requested,
+              line: Math.max(1, Number(request.line || 1)),
+              column: request.column ?? null,
+              word: request.word ?? null,
+            };
+          }
+          return requested;
+        }
+      }
+      const active = activeFileIdRef.current;
+      if (active && candidates.some((file) => file.id === active)) return active;
+      if (initialFileId && candidates.some((file) => file.id === initialFileId)) return initialFileId;
+      if (mainFileId && candidates.some((file) => file.id === mainFileId)) return mainFileId;
+      return (
+        candidates.find((file) => file.role === "main")?.id ??
+        candidates.find((file) => file.name.toLowerCase() === "main.tex")?.id ??
+        candidates.find((file) => file.name.toLowerCase().endsWith(".tex"))?.id ??
+        candidates[0]?.id ??
+        null
+      );
+    };
+
     (async () => {
       try {
-        const items = await listFiles(projectId, latexFolderId);
+        const manifest = await getLatexManifest(projectId, latexFolderId);
         if (cancelled) return;
-        const candidates = items
-          .filter((x) => x.type === "file")
-          .map((x) => ({ id: x.id, name: x.name, path: x.path || undefined }))
-          .sort((a, b) => a.name.localeCompare(b.name));
+        const candidates = manifest.files
+          .map((file) => ({
+            id: file.id,
+            name: file.name,
+            path: file.path || undefined,
+            relativePath: file.relative_path || undefined,
+            role: file.role,
+            editable: file.editable,
+          }))
+          .filter(isEditableLatexManifestFile)
+          .sort((a, b) => {
+            if (a.role === "main" && b.role !== "main") return -1;
+            if (a.role !== "main" && b.role === "main") return 1;
+            return latexFileDisplayPath(a).localeCompare(latexFileDisplayPath(b));
+          });
         setFiles(candidates);
+        setManifestMainFileId(manifest.main_file_id ?? null);
+        setCompiler(normalizeCompiler(manifest.compiler));
 
-        // Resolve a main file if needed.
-        if (!activeFileId) {
-          const main =
-            candidates.find((f) => f.name.toLowerCase() === "main.tex") ??
-            candidates.find((f) => f.name.toLowerCase().endsWith(".tex")) ??
-            candidates[0];
-          if (main) {
-            setActiveFileId(main.id);
-            setActiveFileName(main.name);
-          }
-        } else {
-          const meta = candidates.find((f) => f.id === activeFileId);
-          if (meta) setActiveFileName(meta.name);
+        const nextActiveId = resolveInitialFile(candidates, manifest.main_file_id ?? null);
+        if (nextActiveId) {
+          const meta = candidates.find((file) => file.id === nextActiveId);
+          setActiveFileId(nextActiveId);
+          setActiveFileName(meta?.name || "main.tex");
         }
-      } catch (e) {
-        console.error("[LatexPlugin] Failed to list files:", e);
-        setError(e instanceof Error ? e.message : t("load_files_failed"));
+      } catch (manifestError) {
+        try {
+          const items = await listFiles(projectId, latexFolderId);
+          if (cancelled) return;
+          const candidates = items
+            .filter((x) => x.type === "file")
+            .map((x) => ({ id: x.id, name: x.name, path: x.path || undefined }))
+            .filter(isEditableLatexManifestFile)
+            .sort((a, b) => a.name.localeCompare(b.name));
+          setFiles(candidates);
+          setManifestMainFileId(custom.mainFileId ?? null);
+
+          const nextActiveId = resolveInitialFile(candidates, custom.mainFileId ?? null);
+          if (nextActiveId) {
+            const meta = candidates.find((file) => file.id === nextActiveId);
+            setActiveFileId(nextActiveId);
+            setActiveFileName(meta?.name || "main.tex");
+          }
+        } catch (fallbackError) {
+          console.error("[LatexPlugin] Failed to load files:", fallbackError);
+          setError(
+            fallbackError instanceof Error
+              ? fallbackError.message
+              : manifestError instanceof Error
+                ? manifestError.message
+                : t("load_files_failed")
+          );
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, latexFolderId]);
+  }, [custom.mainFileId, initialFileId, latexFolderId, projectId, t]);
+
+  React.useEffect(() => {
+    if (!activeFileId) return;
+    const meta = files.find((file) => file.id === activeFileId);
+    if (!meta) return;
+    setActiveFileName(meta.name);
+  }, [activeFileId, files]);
 
   React.useEffect(() => {
     citationIndexRef.current = citationIndex;
@@ -721,12 +1185,12 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
 
         const nextCitationIndex = loaded
           .filter((item) => item.file.name.toLowerCase().endsWith(".bib"))
-          .flatMap((item) => parseBibEntries(item.content, item.file.name))
+          .flatMap((item) => parseBibEntries(item.content, latexFileDisplayPath(item.file) || item.file.name))
           .sort((a, b) => a.key.localeCompare(b.key));
 
         const nextLabelIndex = loaded
           .filter((item) => item.file.name.toLowerCase().endsWith(".tex"))
-          .flatMap((item) => parseLatexLabels(item.content, item.file.name))
+          .flatMap((item) => parseLatexLabels(item.content, latexFileDisplayPath(item.file) || item.file.name))
           .sort((a, b) => a.key.localeCompare(b.key));
 
         setCitationIndex(nextCitationIndex);
@@ -751,6 +1215,9 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
         bindingCleanupRef.current?.();
       } finally {
         bindingCleanupRef.current = null;
+        if (boundEditorFileIdRef.current === activeFileId) {
+          boundEditorFileIdRef.current = null;
+        }
       }
     };
   }, [activeFileId]);
@@ -768,6 +1235,9 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
     lastSaveTriggerRef.current = "manual";
     setSaveTrigger("manual");
     failedSaveTextRef.current = null;
+    savedRevisionRef.current = null;
+    loadedRevisionRef.current = null;
+    setExternalConflictState(null);
     setSaveError(null);
     setError(null);
 
@@ -781,16 +1251,21 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       yTextRef.current = ytext;
 
       if (!canUseRealtimeSync) {
-        const seed = await getFileContent(activeFileId);
+        const remoteOrigin = `ds-external:${projectId || "project"}:${activeFileId}:${Date.now()}`;
+        remoteOriginRef.current = remoteOrigin;
+        const seedSnapshot = await getFileContentSnapshot(activeFileId);
+        const seed = seedSnapshot.content;
         ydoc.transact(() => {
           const length = ytext.length || 0;
           if (length) ytext.delete(0, length);
           if (seed) ytext.insert(0, seed);
-        }, "ds-local-seed");
+        }, remoteOrigin);
 
         const textNow = ytext.toString();
         setInitialText(textNow);
         lastSavedRef.current = textNow;
+        loadedRevisionRef.current = seedSnapshot.revision ?? null;
+        savedRevisionRef.current = seedSnapshot.revision ?? null;
         setEditorDirty(false);
         setSyncState("ready");
 
@@ -822,12 +1297,15 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       }
 
       if (forceSeedRef.current) {
-        const seed = await getFileContent(activeFileId);
+        const seedSnapshot = await getFileContentSnapshot(activeFileId);
+        const seed = seedSnapshot.content;
         ydoc.transact(() => {
           const length = ytext.length || 0;
           if (length) ytext.delete(0, length);
           if (seed) ytext.insert(0, seed);
         }, "ds-reset");
+        loadedRevisionRef.current = seedSnapshot.revision ?? null;
+        savedRevisionRef.current = seedSnapshot.revision ?? null;
         if (!effectiveReadOnly) {
           const resetUpdate = encodeStateAsUpdate(ydoc);
           await sync.pushDocUpdate(activeFileId, resetUpdate);
@@ -836,13 +1314,24 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       }
 
       if (!diff) {
-        const seed = await getFileContent(activeFileId);
+        const seedSnapshot = await getFileContentSnapshot(activeFileId);
+        const seed = seedSnapshot.content;
         ydoc.transact(() => {
           ytext.insert(0, seed);
         }, "ds-seed");
+        loadedRevisionRef.current = seedSnapshot.revision ?? null;
+        savedRevisionRef.current = seedSnapshot.revision ?? null;
         if (!effectiveReadOnly) {
           const initUpdate = encodeStateAsUpdate(ydoc);
           await sync.pushDocUpdate(activeFileId, initUpdate);
+        }
+      } else {
+        try {
+          const baselineSnapshot = await getFileContentSnapshot(activeFileId);
+          loadedRevisionRef.current = baselineSnapshot.revision ?? null;
+          savedRevisionRef.current = baselineSnapshot.revision ?? null;
+        } catch {
+          // Keep editing usable even when revision metadata cannot be refreshed.
         }
       }
 
@@ -996,36 +1485,173 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       cancelled = true;
       cleanup?.();
     };
-  }, [activeFileId, canUseRealtimeSync, effectiveReadOnly, projectId, resetNonce, setEditorDirty, socketAuthMode, t, user?.id, user?.username]);
+  }, [activeFileId, canUseRealtimeSync, effectiveReadOnly, projectId, resetNonce, setEditorDirty, setExternalConflictState, socketAuthMode, t, user?.id, user?.username]);
 
-  const jumpEditorToLine = React.useCallback((line: number) => {
+  const revealEditorRange = React.useCallback(
+    (
+      editor: any,
+      range: {
+        startLineNumber: number;
+        startColumn: number;
+        endLineNumber: number;
+        endColumn: number;
+      }
+    ) => {
+      const reveal = () => {
+        try {
+          editor.revealRangeInCenter?.(range, 0);
+          return;
+        } catch {
+          // Fall back to position-based reveal below.
+        }
+        try {
+          editor.revealPositionInCenter?.({
+            lineNumber: range.startLineNumber,
+            column: range.startColumn,
+          });
+        } catch {
+          // ignore
+        }
+      };
+
+      reveal();
+      if (typeof window !== "undefined") {
+        window.requestAnimationFrame(() => {
+          reveal();
+          window.requestAnimationFrame(reveal);
+        });
+        window.setTimeout(reveal, 80);
+      }
+    },
+    []
+  );
+
+  const jumpEditorToLocation = React.useCallback((location: PendingJumpLocation) => {
     const editor = editorRef.current;
     if (!editor) return false;
     const model = editor.getModel?.();
     if (!model) return false;
 
     const maxLine = Math.max(1, Number(model.getLineCount?.() ?? 1));
-    const safeLine = Math.min(Math.max(1, Math.round(line || 1)), maxLine);
-    editor.revealLineInCenter?.(safeLine);
-    editor.setPosition?.({ lineNumber: safeLine, column: 1 });
-    editor.setSelection?.({
-      startLineNumber: safeLine,
-      startColumn: 1,
-      endLineNumber: safeLine,
-      endColumn: Number(model.getLineMaxColumn?.(safeLine) ?? 1),
-    });
-    editor.focus?.();
+    const preciseSelection = location.selection;
+    if (
+      preciseSelection &&
+      typeof preciseSelection.start_line === "number" &&
+      typeof preciseSelection.start_column === "number" &&
+      typeof preciseSelection.end_line === "number" &&
+      typeof preciseSelection.end_column === "number"
+    ) {
+      const startLine = Math.min(Math.max(1, Math.round(preciseSelection.start_line)), maxLine);
+      const endLine = Math.min(Math.max(startLine, Math.round(preciseSelection.end_line)), maxLine);
+      const startMaxColumn = Math.max(1, Number(model.getLineMaxColumn?.(startLine) ?? 1));
+      const endMaxColumn = Math.max(1, Number(model.getLineMaxColumn?.(endLine) ?? 1));
+      const startColumn = Math.min(Math.max(1, Math.round(preciseSelection.start_column)), startMaxColumn);
+      const endColumn = Math.min(Math.max(1, Math.round(preciseSelection.end_column)), endMaxColumn);
+      const selectionEndColumn = startLine === endLine ? Math.max(startColumn, endColumn) : endColumn;
+      const editorSelection = {
+        startLineNumber: startLine,
+        startColumn,
+        endLineNumber: endLine,
+        endColumn: selectionEndColumn,
+      };
+      editor.setPosition?.({ lineNumber: startLine, column: startColumn });
+      editor.setSelection?.(editorSelection);
+      editor.focus?.();
+      revealEditorRange(editor, editorSelection);
+      return true;
+    }
+
+    const safeLine = Math.min(Math.max(1, Math.round(location.line || 1)), maxLine);
+    const maxColumn = Math.max(1, Number(model.getLineMaxColumn?.(safeLine) ?? 1));
+    const requestedColumn =
+      typeof location.column === "number" && Number.isFinite(location.column)
+        ? Math.round(location.column)
+        : 1;
+    const safeColumn = Math.min(Math.max(1, requestedColumn), maxColumn);
+
+    let selection: {
+      startLineNumber: number;
+      startColumn: number;
+      endLineNumber: number;
+      endColumn: number;
+    } | null = null;
+
+    const rawWord = String(location.word || "").trim();
+    const lineContent = String(model.getLineContent?.(safeLine) ?? "");
+    if (rawWord && rawWord.length <= 120 && lineContent) {
+      const lowerLine = lineContent.toLocaleLowerCase();
+      const lowerWord = rawWord.toLocaleLowerCase();
+      const matches: number[] = [];
+      let index = lowerLine.indexOf(lowerWord);
+      while (index >= 0) {
+        matches.push(index);
+        index = lowerLine.indexOf(lowerWord, index + Math.max(1, lowerWord.length));
+      }
+      if (matches.length > 0) {
+        const nearest = matches.reduce((best, next) => {
+          const bestDistance = Math.abs(best + 1 - safeColumn);
+          const nextDistance = Math.abs(next + 1 - safeColumn);
+          return nextDistance < bestDistance ? next : best;
+        }, matches[0]);
+        selection = {
+          startLineNumber: safeLine,
+          startColumn: nearest + 1,
+          endLineNumber: safeLine,
+          endColumn: Math.min(maxColumn, nearest + rawWord.length + 1),
+        };
+      }
+    }
+
+    if (!selection) {
+      const wordAtPosition = model.getWordAtPosition?.({
+        lineNumber: safeLine,
+        column: safeColumn,
+      });
+      if (
+        wordAtPosition &&
+        typeof wordAtPosition.startColumn === "number" &&
+        typeof wordAtPosition.endColumn === "number" &&
+        wordAtPosition.endColumn > wordAtPosition.startColumn
+      ) {
+        selection = {
+          startLineNumber: safeLine,
+          startColumn: wordAtPosition.startColumn,
+          endLineNumber: safeLine,
+          endColumn: wordAtPosition.endColumn,
+        };
+      }
+    }
+
+    const targetColumn = selection?.startColumn ?? safeColumn;
+    if (selection) {
+      editor.setPosition?.({ lineNumber: selection.startLineNumber, column: selection.startColumn });
+      editor.setSelection?.(selection);
+      editor.focus?.();
+      revealEditorRange(editor, selection);
+    } else {
+      const cursorSelection = {
+        startLineNumber: safeLine,
+        startColumn: safeColumn,
+        endLineNumber: safeLine,
+        endColumn: safeColumn,
+      };
+      editor.setSelection?.(cursorSelection);
+      editor.setPosition?.({ lineNumber: safeLine, column: targetColumn });
+      editor.focus?.();
+      revealEditorRange(editor, cursorSelection);
+    }
     return true;
-  }, []);
+  }, [revealEditorRange]);
 
   const flushPendingJump = React.useCallback(() => {
     const pending = pendingJumpRef.current;
     if (!pending) return;
     if (pending.fileId && pending.fileId !== activeFileId) return;
-    if (jumpEditorToLine(pending.line)) {
+    if (!activeFileId || boundEditorFileIdRef.current !== activeFileId) return;
+    if (jumpEditorToLocation(pending)) {
       pendingJumpRef.current = null;
     }
-  }, [activeFileId, jumpEditorToLine]);
+  }, [activeFileId, jumpEditorToLocation]);
 
   const insertAtCursor = React.useCallback((text: string) => {
     const editor = editorRef.current;
@@ -1269,6 +1895,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       } finally {
         applyingRemoteRef.current = false;
       }
+      boundEditorFileIdRef.current = activeFileId;
 
       // Remote delta -> Monaco edits
       const applyDelta = (delta: any[]) => {
@@ -1358,7 +1985,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
         flushPendingJump();
       });
     },
-    [effectiveReadOnly, flushPendingJump, isBibFile, markDirty, t]
+    [activeFileId, effectiveReadOnly, flushPendingJump, isBibFile, markDirty, t]
   );
 
   React.useEffect(() => {
@@ -1366,11 +1993,24 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
     flushPendingJump();
   }, [activeFileId, flushPendingJump, resetNonce, syncState]);
 
-  const save = React.useCallback(async (trigger: LatexSaveTrigger = "manual") => {
+  const save = React.useCallback(async (
+    trigger: LatexSaveTrigger = "manual",
+    opts: { overwriteExternal?: boolean } = {}
+  ) => {
     if (!activeFileId) return false;
     if (effectiveReadOnly) return false;
     const ytext = yTextRef.current;
     if (!ytext) return false;
+    const externalConflictForSave = externalConflictRef.current;
+    const overwriteExternal = opts.overwriteExternal === true;
+    if (externalConflictForSave && !overwriteExternal) {
+      failedSaveTextRef.current = String(ytext.toString?.() ?? "");
+      saveStateRef.current = "error";
+      setSaveError(t("external_change_save_blocked"));
+      setSaveState("error");
+      setEditorDirty(true);
+      return false;
+    }
 
     const activeInFlight = saveInFlightRef.current;
     if (activeInFlight && activeInFlight.fileId === activeFileId) {
@@ -1391,7 +2031,13 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
         failedSaveTextRef.current = null;
         setSaveError(null);
         setSaveState("saving");
-        const res = await updateFileContent(fileId, textToSave);
+        const expectedRevision = overwriteExternal
+          ? externalConflictForSave?.remoteRevision ?? savedRevisionRef.current
+          : savedRevisionRef.current;
+        const res = await updateFileContent(fileId, textToSave, {
+          revision: expectedRevision,
+          force: overwriteExternal && !expectedRevision,
+        });
 
         if (res?.updated_at) {
           updateFileMeta(fileId, {
@@ -1407,7 +2053,11 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
 
         const currentYText = yTextRef.current;
         const currentText = currentYText ? String(currentYText.toString?.() ?? "") : "";
+        const nextRevision = typeof res?.revision === "string" ? res.revision : null;
+        savedRevisionRef.current = nextRevision;
+        loadedRevisionRef.current = nextRevision;
         lastSavedRef.current = textToSave;
+        setExternalConflictState(null);
         saveStateRef.current = "idle";
         setSaveState("idle");
 
@@ -1421,9 +2071,33 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       } catch (e) {
         console.error("[LatexPlugin] Save failed:", e);
         if (activeFileIdRef.current === fileId) {
+          const maybeConflict = e as Error & {
+            conflict?: boolean;
+            currentRevision?: string | null;
+            updatedPayload?: {
+              content?: string;
+              revision?: string;
+              updated_at?: string;
+            };
+          };
+          if (maybeConflict.conflict && maybeConflict.updatedPayload) {
+            setExternalConflictState({
+              fileId,
+              remoteContent: String(maybeConflict.updatedPayload.content ?? ""),
+              remoteRevision: maybeConflict.updatedPayload.revision ?? maybeConflict.currentRevision ?? null,
+              remoteUpdatedAt: maybeConflict.updatedPayload.updated_at ?? null,
+              reason: "save_conflict",
+            });
+          }
           failedSaveTextRef.current = textToSave;
           saveStateRef.current = "error";
-          setSaveError(e instanceof Error ? e.message : t("save_request_failed"));
+          setSaveError(
+            maybeConflict.conflict
+              ? t("external_change_save_blocked")
+              : e instanceof Error
+                ? e.message
+                : t("save_request_failed")
+          );
           setSaveState("error");
           setEditorDirty(true);
         }
@@ -1437,13 +2111,111 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
 
     saveInFlightRef.current = { fileId, promise };
     return promise;
-  }, [activeFileId, effectiveReadOnly, setEditorDirty, t, updateFileMeta]);
+  }, [activeFileId, effectiveReadOnly, setEditorDirty, setExternalConflictState, t, updateFileMeta]);
+
+  const reloadExternalVersion = React.useCallback(() => {
+    const conflict = externalConflictRef.current;
+    if (!conflict) return;
+    applyFileSnapshotToEditor(conflict.fileId, {
+      content: conflict.remoteContent,
+      revision: conflict.remoteRevision ?? null,
+      updated_at: conflict.remoteUpdatedAt ?? null,
+    });
+  }, [applyFileSnapshotToEditor]);
+
+  const overwriteExternalVersion = React.useCallback(() => {
+    void save("manual", { overwriteExternal: true });
+  }, [save]);
+
+  const switchToLatexFile = React.useCallback(
+    async (
+      fileId: string | null | undefined,
+      opts?: {
+        line?: number | null;
+        column?: number | null;
+        word?: string | null;
+        selection?: LatexSyncTexSelection | null;
+            }
+    ) => {
+      if (!fileId) return false;
+      const targetMeta = files.find((file) => file.id === fileId);
+      if (!targetMeta) return false;
+
+      if (!effectiveReadOnly && (isDirtyRef.current || saveStateRef.current === "saving")) {
+        const saved = await save("lifecycle");
+        if (!saved && isDirtyRef.current) return false;
+      }
+
+      setActiveFileName(targetMeta.name);
+      setReferencePanelOpen(false);
+      setBibPanelOpen(false);
+      setAssistQuery("");
+
+      if (opts?.line) {
+        pendingJumpRef.current = {
+          fileId,
+          line: Math.max(1, Number(opts.line || 1)),
+          column: opts.column ?? null,
+          word: opts.word ?? null,
+          selection: opts.selection ?? null,
+        };
+      }
+
+      if (fileId !== activeFileIdRef.current) {
+        boundEditorFileIdRef.current = null;
+        setSyncState("loading");
+        setInitialText("");
+        setActiveFileId(fileId);
+        return true;
+      }
+
+      flushPendingJump();
+      return true;
+    },
+    [effectiveReadOnly, files, flushPendingJump, save]
+  );
+
+  const handleLatexOpenRequest = React.useCallback(
+    (request: LatexOpenFileRequest) => {
+      const targetFileId = resolveLatexOpenRequestFileId(files, request);
+      if (!targetFileId) return false;
+      void switchToLatexFile(targetFileId, {
+        line: request.line ?? null,
+        column: request.column ?? null,
+        word: request.word ?? null,
+      });
+      return true;
+    },
+    [files, switchToLatexFile]
+  );
+
+  React.useEffect(() => {
+    if (!projectId || !latexFolderId || files.length === 0) return;
+
+    for (const request of consumeLatexOpenFileRequests(projectId, latexFolderId)) {
+      handleLatexOpenRequest(request);
+    }
+
+    const listener = (event: Event) => {
+      const detail = (event as CustomEvent<LatexOpenFileRequest>).detail;
+      if (!detail) return;
+      if (detail.latexFolderId !== latexFolderId) return;
+      if (detail.projectId && detail.projectId !== projectId) return;
+      handleLatexOpenRequest(detail);
+    };
+
+    window.addEventListener(LATEX_OPEN_FILE_EVENT, listener as EventListener);
+    return () => {
+      window.removeEventListener(LATEX_OPEN_FILE_EVENT, listener as EventListener);
+    };
+  }, [files.length, handleLatexOpenRequest, latexFolderId, projectId]);
 
   React.useEffect(() => {
     if (!activeFileId) return;
     if (effectiveReadOnly) return;
     if (syncState !== "ready") return;
     if (!isDirty) return;
+    if (externalConflictRef.current) return;
     if (saveState === "saving") return;
 
     const currentText = getCurrentText();
@@ -1454,6 +2226,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
     const timer = window.setTimeout(() => {
       if (!activeFileIdRef.current) return;
       if (!isDirtyRef.current) return;
+      if (externalConflictRef.current) return;
       if (saveStateRef.current === "saving") return;
       const latestText = getCurrentText();
       if (saveStateRef.current === "error" && failedSaveTextRef.current === latestText) {
@@ -1466,6 +2239,54 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       window.clearTimeout(timer);
     };
   }, [activeFileId, dirtyVersion, effectiveReadOnly, getCurrentText, isDirty, save, saveState, syncState]);
+
+  React.useEffect(() => {
+    if (!activeFileId) return;
+    if (syncState !== "ready") return;
+    const interval = window.setInterval(() => {
+      void checkExternalSnapshot("poll");
+    }, LATEX_EXTERNAL_CHECK_INTERVAL_MS);
+
+    const handleFocus = () => {
+      void checkExternalSnapshot("focus");
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void checkExternalSnapshot("visibility");
+      }
+    };
+
+    window.addEventListener("focus", handleFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", handleFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [activeFileId, checkExternalSnapshot, syncState]);
+
+  React.useEffect(() => {
+    if (!activeFileId) return;
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        fileId?: string;
+        filePath?: string;
+        projectId?: string;
+      }>).detail;
+      if (!detail) return;
+      if (detail.projectId && projectId && detail.projectId !== projectId) return;
+      const activeMeta = files.find((file) => file.id === activeFileId) ?? null;
+      const filePath = String(detail.filePath || "").replace(/^\/+/, "");
+      const matches =
+        detail.fileId === activeFileId ||
+        (filePath && resolveLatexFileId(files, filePath) === activeFileId) ||
+        (filePath && activeMeta && [activeMeta.path, activeMeta.relativePath].filter(Boolean).includes(filePath));
+      if (!matches) return;
+      void checkExternalSnapshot("diff");
+    };
+    window.addEventListener("ds:file:diff", handler as EventListener);
+    return () => window.removeEventListener("ds:file:diff", handler as EventListener);
+  }, [activeFileId, checkExternalSnapshot, files, projectId]);
 
   React.useEffect(() => {
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
@@ -1507,6 +2328,8 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       try {
         setBuildError(null);
         setBuildErrors([]);
+        setSynctexError(null);
+        setSynctexReady(false);
         setLogText(null);
         buildStatusRef.current = "queued";
         setBuildStatus("queued");
@@ -1518,11 +2341,13 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
         });
         setBuildId(res.build_id);
         setCompiler(normalizeCompiler(res.compiler));
+        setSynctexReady(Boolean(res.synctex_ready));
         buildStatusRef.current = res.status ?? "queued";
         setBuildStatus(res.status ?? "queued");
       } catch (e) {
         console.error("[LatexPlugin] Compile failed:", e);
         setBuildError(e instanceof Error ? e.message : t("compile_request_failed"));
+        setSynctexReady(false);
         buildStatusRef.current = "error";
         setBuildStatus("error");
       }
@@ -1581,6 +2406,8 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       setBuildStatus(detail.status ?? "queued");
       setBuildError(detail.errorMessage ?? null);
       setBuildErrors([]);
+      setSynctexReady(false);
+      setSynctexError(null);
       setLogText(null);
     };
 
@@ -1606,6 +2433,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
           setBuildStatus(latest.status ?? "idle");
           setBuildError(latest.error_message ?? null);
           setBuildErrors(normalizeBuildErrors(latest.errors, latest.log_items));
+          setSynctexReady(Boolean(latest.synctex_ready));
         }
       } catch {
         // ignore
@@ -1630,6 +2458,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
         setBuildStatus(res.status);
         setBuildError(res.error_message ?? null);
         setBuildErrors(normalizeBuildErrors(res.errors, res.log_items));
+        setSynctexReady(Boolean(res.synctex_ready));
 
         if (res.status === "success" && res.pdf_ready) {
           if (lastLoadedPdfBuildIdRef.current !== buildId) {
@@ -1759,6 +2588,13 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
           "border-[#8FA3B8]/30 bg-[#8FA3B8]/10 text-[#52667a] dark:bg-[#8FA3B8]/12 dark:text-[#c8d4df]",
       };
     }
+    if (externalConflict) {
+      return {
+        label: t("status_external_changed"),
+        className:
+          "border-amber-400/40 bg-amber-50/90 text-amber-700 dark:bg-amber-500/10 dark:text-amber-200",
+      };
+    }
     if (saveState === "saving") {
       const autosaveLike = saveTrigger === "auto" || saveTrigger === "lifecycle";
       return {
@@ -1793,7 +2629,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
       className:
         "border-[#9AA79A]/30 bg-[#9AA79A]/12 text-[#5f6b5f] dark:bg-[#9AA79A]/12 dark:text-[#dbe4db]",
     };
-  }, [buildStatus, effectiveReadOnly, isDirty, saveError, saveState, saveTrigger, t]);
+  }, [buildStatus, effectiveReadOnly, externalConflict, isDirty, saveError, saveState, saveTrigger, t]);
 
   const buildFocusedIssue = React.useCallback(
     (issue: LatexBuildError) => {
@@ -1891,24 +2727,11 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
         null;
       if (!targetFileId) return;
 
-      const targetMeta = files.find((file) => file.id === targetFileId);
-      pendingJumpRef.current = {
-        fileId: targetFileId,
+      void switchToLatexFile(targetFileId, {
         line: Math.max(1, Number(issue.line || 1)),
-      };
-
-      if (targetMeta?.name && targetMeta.name !== activeFileName) {
-        setActiveFileName(targetMeta.name);
-      }
-
-      if (targetFileId !== activeFileId) {
-        setActiveFileId(targetFileId);
-        return;
-      }
-
-      flushPendingJump();
+      });
     },
-    [activeFileId, activeFileName, files, flushPendingJump, focusBuildIssue]
+    [activeFileId, files, focusBuildIssue, switchToLatexFile]
   );
 
   const handleAskDeepScientistForIssue = React.useCallback(
@@ -2047,6 +2870,58 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
     setPdfPageWidth(width || PAGE_DIMENSIONS.A4_WIDTH);
   }, []);
 
+  const handlePdfPointDoubleClick = React.useCallback(
+    async (point: PdfSourcePoint) => {
+      if (!projectId || !latexFolderId || !buildId) return;
+      setSynctexError(null);
+
+      if (!synctexReady) {
+        setSynctexError(t("synctex_unavailable_hint"));
+        return;
+      }
+
+      setSynctexBusy(true);
+      try {
+        const result = await syncTexEditLatexBuild(projectId, latexFolderId, buildId, {
+          page: point.page,
+          x: point.x,
+          y: point.y,
+          pdf_word: point.word ?? null,
+          pdf_context_words: point.contextWords ?? null,
+          pdf_context_index: point.contextIndex ?? null,
+          pdf_word_bbox: point.wordBBox ?? null,
+          pdf_word_center: point.wordCenter ?? null,
+        });
+        if (!result.ok) {
+          setSynctexError(result.message || t("synctex_not_found"));
+          return;
+        }
+        const targetFileId =
+          resolveLatexFileId(files, result.file_path) ??
+          (result.file_id && files.some((file) => file.id === result.file_id) ? result.file_id : null);
+        if (!targetFileId) {
+          setSynctexError(t("synctex_source_not_loaded"));
+          return;
+        }
+        const switched = await switchToLatexFile(targetFileId, {
+          line: result.line ?? 1,
+          column: result.column ?? null,
+          word: result.pdf_word ?? point.word ?? null,
+          selection: result.selection ?? null,
+        });
+        if (!switched) {
+          setSynctexError(t("synctex_switch_failed"));
+        }
+      } catch (e) {
+        console.error("[LatexPlugin] SyncTeX reverse sync failed:", e);
+        setSynctexError(e instanceof Error ? e.message : t("synctex_failed"));
+      } finally {
+        setSynctexBusy(false);
+      }
+    },
+    [buildId, files, latexFolderId, projectId, switchToLatexFile, synctexReady, t]
+  );
+
   const handleResizeStart = React.useCallback(
     (event: React.PointerEvent<HTMLDivElement>) => {
       if (!isWideLayout || !splitContainerRef.current) return;
@@ -2113,42 +2988,39 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
               : undefined
           }
         >
-          <div className="flex flex-wrap items-center gap-2 px-3 py-2 border-b border-black/5 dark:border-white/10">
-            <div className="flex items-center gap-2 min-w-0">
-              <FileText className="h-4 w-4 text-muted-foreground shrink-0" />
+          <div className="flex h-10 shrink-0 flex-nowrap items-center gap-1 overflow-x-auto border-b border-black/5 px-2 py-1 dark:border-white/10">
+            <div className="flex min-w-0 shrink items-center gap-1">
+              <FileText className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
               <select
                 className={cn(
-                  "h-8 rounded-lg px-2 text-sm bg-white/70 border border-black/10",
+                  "h-7 rounded-md px-2 text-xs bg-white/70 border border-black/10",
                   "dark:bg-white/[0.04] dark:border-white/10",
-                  "min-w-[160px] max-w-[260px] truncate",
+                  "min-w-[140px] max-w-[220px] truncate",
                   effectiveReadOnly && "opacity-70"
                 )}
-                value={activeFileId ?? ""}
-                onChange={(e) => {
-                  const next = e.target.value || null;
-                  const meta = files.find((f) => f.id === next);
-                  if (meta) setActiveFileName(meta.name);
-                  setActiveFileId(next);
-                }}
-                disabled={files.length === 0}
-                aria-label={t("file_label")}
-                title={activeFileName}
-              >
-                {files.map((f) => (
-                  <option key={f.id} value={f.id}>
-                    {f.name}
-                  </option>
-                ))}
-              </select>
-            </div>
+	                value={activeFileId ?? ""}
+	                onChange={(e) => {
+	                  void switchToLatexFile(e.target.value || null);
+	                }}
+	                disabled={files.length === 0}
+	                aria-label={t("file_label")}
+	                title={latexFileDisplayPath(files.find((file) => file.id === activeFileId)) || activeFileName}
+	              >
+	                {files.map((f) => (
+	                  <option key={f.id} value={f.id}>
+	                    {latexFileDisplayPath(f)}
+	                  </option>
+	                ))}
+	              </select>
+	            </div>
 
-            <div className="flex items-center gap-2">
-              <span className="text-xs text-muted-foreground">{t("compiler_label")}</span>
+            <div className="flex shrink-0 items-center gap-1">
+              <span className="sr-only">{t("compiler_label")}</span>
               <select
                 className={cn(
-                  "h-8 rounded-lg px-2 text-sm bg-white/70 border border-black/10",
+                  "h-7 rounded-md px-2 text-xs bg-white/70 border border-black/10",
                   "dark:bg-white/[0.04] dark:border-white/10",
-                  "min-w-[122px]",
+                  "min-w-[104px]",
                   buildStatus === "queued" || buildStatus === "running" ? "opacity-70" : ""
                 )}
                 value={compiler}
@@ -2167,7 +3039,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
 
             <label
               className={cn(
-                "h-8 px-2.5 rounded-lg text-xs border inline-flex items-center gap-2",
+                "h-7 shrink-0 whitespace-nowrap px-2 rounded-md text-xs border inline-flex items-center gap-1",
                 "bg-white/70 border-black/10 text-muted-foreground",
                 "dark:bg-white/[0.04] dark:border-white/10",
                 viewReadOnly && "opacity-70"
@@ -2181,7 +3053,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                 disabled={viewReadOnly}
                 onChange={(event) => updateAutoCompileOnSave(event.target.checked)}
               />
-              <span>{t("auto_compile_on_save")}</span>
+              <span className="hidden xl:inline">{t("auto_compile_on_save")}</span>
             </label>
 
             {!isBibFile ? (
@@ -2196,7 +3068,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                   });
                 }}
                 className={cn(
-                  "h-8 px-3 rounded-lg text-sm border inline-flex items-center gap-2",
+                  "h-7 shrink-0 whitespace-nowrap px-2 rounded-md text-xs border inline-flex items-center gap-1",
                   "bg-white/70 border-black/10 hover:bg-white/90",
                   "dark:bg-white/[0.04] dark:border-white/10 dark:hover:bg-white/[0.08]",
                   referencePanelOpen && "border-[#8FA3B8]/28 bg-[#8FA3B8]/12 text-[#405267]"
@@ -2204,8 +3076,8 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                 aria-label={t("assist_references")}
                 title={t("assist_references")}
               >
-                <Link2 className="h-4 w-4" />
-                {t("assist_references")}
+                <Link2 className="h-3.5 w-3.5" />
+                <span className="hidden xl:inline">{t("assist_references")}</span>
               </button>
             ) : null}
 
@@ -2221,7 +3093,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                   });
                 }}
                 className={cn(
-                  "h-8 px-3 rounded-lg text-sm border inline-flex items-center gap-2",
+                  "h-7 shrink-0 whitespace-nowrap px-2 rounded-md text-xs border inline-flex items-center gap-1",
                   "bg-white/70 border-black/10 hover:bg-white/90",
                   "dark:bg-white/[0.04] dark:border-white/10 dark:hover:bg-white/[0.08]",
                   bibPanelOpen && "border-[#A99EBE]/28 bg-[#A99EBE]/12 text-[#564f6a]"
@@ -2229,15 +3101,15 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                 aria-label={t("assist_bibtex")}
                 title={t("assist_bibtex")}
               >
-                <AtSign className="h-4 w-4" />
-                {t("assist_bibtex")}
+                <AtSign className="h-3.5 w-3.5" />
+                <span className="hidden xl:inline">{t("assist_bibtex")}</span>
               </button>
             ) : null}
 
-            <div className="ml-auto flex items-center gap-2">
+            <div className="ml-auto flex shrink-0 items-center gap-1">
               <span
                 className={cn(
-                  "text-xs px-2 py-0.5 rounded-full border",
+                  "inline-flex h-6 items-center whitespace-nowrap text-[11px] px-1.5 rounded-full border",
                   statusBadge.className
                 )}
               >
@@ -2249,7 +3121,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                 onClick={() => void triggerManualSave()}
                 disabled={effectiveReadOnly || saveState === "saving"}
                 className={cn(
-                  "h-8 px-3 rounded-lg text-sm font-medium border",
+                  "h-7 whitespace-nowrap px-2 rounded-md text-xs font-medium border",
                   "bg-white/70 border-black/10 hover:bg-white/90",
                   "dark:bg-white/[0.04] dark:border-white/10 dark:hover:bg-white/[0.08]",
                   "disabled:opacity-50 disabled:cursor-not-allowed",
@@ -2257,13 +3129,13 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                 )}
               >
                 {saveState === "saving" ? (
-                  <span className="flex items-center gap-2">
-                    <Loader2 className="h-4 w-4 animate-spin" />
+                  <span className="flex items-center gap-1">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
                     {t("button_saving")}
                   </span>
                 ) : (
-                  <span className="flex items-center gap-2">
-                    <Save className="h-4 w-4" />
+                  <span className="flex items-center gap-1">
+                    <Save className="h-3.5 w-3.5" />
                     {t("button_save")}
                   </span>
                 )}
@@ -2279,7 +3151,7 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                   buildStatus === "running"
                 }
                 className={cn(
-                  "h-8 px-3 rounded-lg text-sm font-medium border",
+                  "h-7 whitespace-nowrap px-2 rounded-md text-xs font-medium border",
                   "bg-[#8FA3B8]/14 border-[#8FA3B8]/28 text-[#405267] hover:bg-[#8FA3B8]/20",
                   "dark:bg-[#8FA3B8]/14 dark:border-[#8FA3B8]/22 dark:text-[#dbe6ef] dark:hover:bg-[#8FA3B8]/20",
                   "disabled:opacity-50 disabled:cursor-not-allowed"
@@ -2293,19 +3165,19 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                 }
               >
                 {buildStatus === "queued" || buildStatus === "running" ? (
-                  <span className="flex items-center gap-2">
-                    <Loader2 className="h-4 w-4 animate-spin" />
+                  <span className="flex items-center gap-1">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
                     {t("button_compiling")}
                   </span>
                 ) : (
-                  <span className="flex items-center gap-2">
-                    <Play className="h-4 w-4" />
+                  <span className="flex items-center gap-1">
+                    <Play className="h-3.5 w-3.5" />
                     {isDirty && !effectiveReadOnly ? t("button_save_and_compile") : t("button_compile")}
                   </span>
                 )}
-              </button>
-            </div>
-	          </div>
+	              </button>
+	            </div>
+		          </div>
 
             {showAssistPanel ? (
               <div className="border-b border-black/5 dark:border-white/10 bg-black/[0.02] dark:bg-white/[0.02] px-3 py-3">
@@ -2473,12 +3345,46 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                   suggestOnTriggerCharacters: true,
                   acceptSuggestionOnCommitCharacter: true,
                   renderWhitespace: "selection",
+                  selectionHighlight: false,
+                  occurrencesHighlight: "off",
                   tabSize: 2,
                   insertSpaces: true,
                 }}
               />
             )}
           </div>
+
+        {externalConflict ? (
+          <div className="border-t border-amber-300/30 bg-amber-50/80 dark:bg-amber-500/10 dark:border-amber-300/20 p-4 text-sm">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="flex min-w-0 items-start gap-2 text-amber-800 dark:text-amber-100">
+                <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+                <div className="min-w-0">
+                  <div className="font-medium">{t("external_change_title")}</div>
+                  <div className="text-xs opacity-90 break-words">
+                    {t("external_change_dirty_message")}
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+                <button
+                  type="button"
+                  className="inline-flex items-center rounded-md border border-amber-400/40 bg-white/80 px-2.5 py-1.5 text-xs font-medium text-amber-800 hover:bg-white dark:bg-white/[0.06] dark:text-amber-100 dark:hover:bg-white/[0.1]"
+                  onClick={reloadExternalVersion}
+                >
+                  {t("external_change_reload")}
+                </button>
+                <button
+                  type="button"
+                  className="inline-flex items-center rounded-md border border-red-400/30 bg-white/80 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-white dark:bg-white/[0.06] dark:text-red-200 dark:hover:bg-white/[0.1]"
+                  onClick={overwriteExternalVersion}
+                >
+                  {t("external_change_overwrite")}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
 
         {saveError ? (
           <div className="border-t border-black/5 dark:border-white/10 p-4 text-sm">
@@ -2626,11 +3532,27 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                 title={t("download_pdf")}
               >
                 <Download className="h-3.5 w-3.5" />
-              </a>
-            </div>
+	              </a>
+	            </div>
 
-            {pdfObjectUrl ? (
-              <PdfLoader
+              {pdfObjectUrl && (synctexBusy || synctexError) ? (
+                <div
+                  className={cn(
+                    "absolute bottom-3 left-3 z-10 max-w-[min(460px,calc(100%-1.5rem))] rounded-xl border px-3 py-2 text-xs shadow-sm backdrop-blur",
+                    synctexError
+                      ? "border-amber-400/30 bg-amber-50/90 text-amber-800 dark:bg-amber-500/10 dark:text-amber-100"
+                      : "border-black/10 bg-white/75 text-muted-foreground dark:border-white/10 dark:bg-black/40"
+                  )}
+                >
+                  <div className="flex items-center gap-2">
+                    {synctexBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                    <span>{synctexError ?? t("synctex_resolving")}</span>
+                  </div>
+                </div>
+              ) : null}
+
+	            {pdfObjectUrl ? (
+	              <PdfLoader
                 url={pdfObjectUrl}
                 workerSrc={PDF_WORKER_SRC}
                 cMapUrl={PDF_CMAP_URL}
@@ -2645,11 +3567,12 @@ export default function LatexPlugin({ context, tabId, setDirty, setTitle }: Plug
                 {(pdfDocument) => (
                   <PdfSurface
                     pdfDocument={pdfDocument}
-                    zoomFactor={zoomScale}
-                    highlights={emptyHighlights}
-                    onPageWidth={handlePageWidth}
-                  />
-                )}
+	                    zoomFactor={zoomScale}
+	                    highlights={emptyHighlights}
+	                    onPageWidth={handlePageWidth}
+	                    onPointDoubleClick={handlePdfPointDoubleClick}
+	                  />
+	                )}
               </PdfLoader>
             ) : buildStatus === "queued" || buildStatus === "running" ? (
               <div className="flex-1 flex items-center justify-center text-sm text-muted-foreground">

@@ -341,7 +341,13 @@ In practice, many users treat Markdown files in the quest as a private local-fir
 - findings
 - team coordination
 
-When you open a LaTeX project folder, the browser editor auto-saves source edits shortly after you type. Background autosaves only persist the source; they do not start PDF compilation. Manual saves default to compile-on-save: `Ctrl/Cmd+S` or the `Save` button saves the active LaTeX file and then starts one PDF compilation when the save succeeds. `Save & Compile` remains available for an explicit compile action and still saves the current source before starting PDF compilation.
+When you open a LaTeX project folder, the browser editor treats the folder as one LaTeX workspace. Source files such as `main.tex`, chapter files under subfolders, BibTeX files, and style files switch inside the same editor, Overleaf-style, instead of spawning separate top-level editors or internal source tabs. The file picker still lists the full project source tree for quick switching.
+
+The editor auto-saves source edits shortly after you type. Background autosaves only persist the source; they do not start PDF compilation. Manual saves default to compile-on-save: `Ctrl/Cmd+S` or the `Save` button saves the active LaTeX file and then starts one PDF compilation when the save succeeds. `Save & Compile` remains available for an explicit compile action and still saves the current source before starting PDF compilation.
+
+If another process changes the active LaTeX source file while it is open, such as an AI edit or terminal command, the editor refreshes automatically when the local buffer has no unsaved edits. If the local buffer is dirty, autosave pauses and the editor asks you to either reload the external version or explicitly overwrite it, so an ordinary save cannot silently replace external changes.
+
+After a successful compile, the PDF preview uses SyncTeX metadata when available. Double-click a rendered PDF word to jump back to the matching LaTeX source file and select the corresponding source token; the editor uses the PDF word box plus multiple SyncTeX samples to avoid broad line-level selections. Older builds without SyncTeX data need to be recompiled before PDF-to-source jumps are available.
 
 ### 6.5 Canvas
 
